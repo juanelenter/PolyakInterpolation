@@ -1,37 +1,64 @@
 # Libraries
-import torch
+import random
+import os
+import argparse
 import matplotlib.pyplot as plt
-import torch.nn as nn
-from torch import optim
-from torch.autograd import Variable
-from torchvision import datasets
-import torchvision
-from torchvision.transforms import ToTensor
 import numpy as np
-import torchvision.transforms as transforms
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
-from datasets import get_dataset
+import torch.backends.cudnn as cudnn
+import torchvision
+import torchvision.transforms as transforms
+
+import resnet
+
 from sps import Sps, SpsL1, SpsL2, ALIG
 
-# Reproducibility
-def set_all_seeds(seed):
+import wandb
+
+def seed_everything(seed: int):    
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     
-set_all_seeds(4568)
+seed_everything(4568)
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device used: {device}")
 
-dataset_name = "CIFAR"
-train_data, test_data, loaders = get_dataset(dataset_name)
+# Data setup
+print('==> Preparing data..')
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
+
+transform_test = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
+
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=128, shuffle=True, num_workers=2)
+
+testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
+
 
 def map2simplex(mapping = "softmax"):
     
-    assert mapping in ["Softmax", "Taylor", "NormalizedRelu", "TaylorInter"], "Mapping not available."
+    assert mapping in ["Softmax", "Taylor", "NormalizedRelu", "TaylorInter", "SparseMax"], "Mapping not available."
     
     if mapping == "Softmax":
         return nn.LogSoftmax()
@@ -41,6 +68,8 @@ def map2simplex(mapping = "softmax"):
         return Taylor()
     elif mapping == "TaylorInter":
         return TaylorInter()
+    elif mapping == "SparseMax":
+        return Sparsemax()
     
 class NormalizedRelu(nn.Module):
     """
@@ -80,9 +109,83 @@ class TaylorInter(nn.Module):
         out = torch.log( numerator*(1/denominator[:, None]) + 1e-12 )
         return out
 
+class Sparsemax(nn.Module):
+    """Sparsemax function."""
+
+    def __init__(self, dim=None):
+        """Initialize sparsemax activation
+        
+        Args:
+            dim (int, optional): The dimension over which to apply the sparsemax function.
+        """
+        super(Sparsemax, self).__init__()
+
+        self.dim = -1 if dim is None else dim
+
+    def forward(self, input):
+        """Forward function.
+        Args:
+            input (torch.Tensor): Input tensor. First dimension should be the batch size
+        Returns:
+            torch.Tensor: [batch_size x number_of_logits] Output tensor
+        """
+        # Sparsemax currently only handles 2-dim tensors,
+        # so we reshape to a convenient shape and reshape back after sparsemax
+        input = input.transpose(0, self.dim)
+        original_size = input.size()
+        input = input.reshape(input.size(0), -1)
+        input = input.transpose(0, 1)
+        dim = 1
+
+        number_of_logits = input.size(dim)
+
+        # Translate input by max for numerical stability
+        input = input - torch.max(input, dim=dim, keepdim=True)[0].expand_as(input)
+
+        # Sort input in descending order.
+        # (NOTE: Can be replaced with linear time selection method described here:
+        # http://stanford.edu/~jduchi/projects/DuchiShSiCh08.html)
+        zs = torch.sort(input=input, dim=dim, descending=True)[0]
+        range = torch.arange(start=1, end=number_of_logits + 1, step=1, device=device, dtype=input.dtype).view(1, -1)
+        range = range.expand_as(zs)
+
+        # Determine sparsity of projection
+        bound = 1 + range * zs
+        cumulative_sum_zs = torch.cumsum(zs, dim)
+        is_gt = torch.gt(bound, cumulative_sum_zs).type(input.type())
+        k = torch.max(is_gt * range, dim, keepdim=True)[0]
+
+        # Compute threshold function
+        zs_sparse = is_gt * zs
+
+        # Compute taus
+        taus = (torch.sum(zs_sparse, dim, keepdim=True) - 1) / k
+        taus = taus.expand_as(input)
+
+        # Sparsemax
+        self.output = torch.max(torch.zeros_like(input), input - taus)
+
+        # Reshape back to original shape
+        output = self.output
+        output = output.transpose(0, 1)
+        output = output.reshape(original_size)
+        output = output.transpose(0, self.dim)
+
+        return output
+
+    def backward(self, grad_output):
+        """Backward function."""
+        dim = 1
+
+        nonzeros = torch.ne(self.output, 0)
+        sum = torch.sum(grad_output * nonzeros, dim=dim) / torch.sum(nonzeros, dim=dim)
+        self.grad_input = nonzeros * (grad_output - sum.expand_as(grad_output))
+
+        return self.grad_input 
+
+
 class CIFARCNN(nn.Module):
    
-
     def __init__(self, mapping):
         
         super(CIFARCNN, self).__init__()
@@ -115,7 +218,6 @@ class CIFARCNN(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2),
         )
 
-
         self.fc_layer = nn.Sequential(
             nn.Dropout(p=0.1),
             nn.Linear(4096, 1024),
@@ -146,6 +248,75 @@ class CIFARCNN(nn.Module):
 
         return out, x
 
+cnn = resnet.ResNet18(mapping="TaylorInter")
+criterion = nn.NLLLoss()
+optimizer = optim.SGD(net.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+
+# Training
+def train(epoch):
+    print('\nEpoch: %d' % epoch)
+    net.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = net(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+
+        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                     % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+
+
+def test(epoch):
+    global best_acc
+    net.eval()
+    test_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(testloader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = net(inputs)
+            loss = criterion(outputs, targets)
+
+            test_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+
+            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                         % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
+
+    # Save checkpoint.
+    acc = 100.*correct/total
+    if acc > best_acc:
+        print('Saving..')
+        state = {
+            'net': net.state_dict(),
+            'acc': acc,
+            'epoch': epoch,
+        }
+        if not os.path.isdir('checkpoint'):
+            os.mkdir('checkpoint')
+        torch.save(state, './checkpoint/ckpt.pth')
+        best_acc = acc
+
+
+for epoch in range(10):
+    train(epoch)
+    test(epoch)
+    scheduler.step()
+
 def evaluate(cnn, loader):
     cnn.eval()
     with torch.no_grad():
@@ -157,7 +328,7 @@ def evaluate(cnn, loader):
             pred_y = torch.max(output, 1)[1].data.squeeze()
             acc.append( (pred_y == labels).sum().item() / float(labels.size(0)) )       
         return acc, loss
-      
+
 def train(num_epochs, cnn, loaders):
     
     show_every = 150
